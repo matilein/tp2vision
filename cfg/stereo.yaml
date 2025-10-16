@@ -1,0 +1,9 @@
+video:
+  left: -1
+  right: -1
+
+name: Stereo_Offline
+resolution: 1280x480
+checkerboard: 10x7
+square_size: 24.2
+data: data/
