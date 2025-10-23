@@ -5,27 +5,20 @@ import pickle
 
 def calc_disparidad(
     rectified_dir="data/rectified",
-    data_dir="data",              # para leer validRoi (opcional)
+    data_dir="data",
     method="SGBM",
     min_disparity=0,
-    num_disparities=224,          # múltiplo de 16
-    block_size=9,                 # 7–11 suele ir bien
-    use_wls=False,                # requiere opencv-contrib-python
+    num_disparities=160,  # aumentado para más rango
+    block_size=7,         # aumentado para reducir ruido
+    use_wls=False,
     pair_index=None,
     name_pattern=None,
-    use_valid_roi=True,           # recorta a intersección de ROIs válidas si existen
-    n_show=5,                     # <<< mostrar solo 5 al azar
-    random_state=None             # <<< semilla para reproducibilidad
+    use_valid_roi=True,
+    n_show=5,
+    random_state=None
 ):
     """
-    Calcula mapas de disparidad para TODOS los pares seleccionados,
-    pero SOLO muestra n_show casos aleatorios.
-
-    - Preprocesado CLAHE + blur
-    - SGBM (o BM) con parámetros robustos
-    - WLS opcional (si está cv2.ximgproc)
-    - Filtro por índice o patrón de nombre
-    - Recorte opcional por ROI válida (validRoi1/2) si existe en stereo_maps.pkl
+    Calcula mapas de disparidad con filtrado robusto de outliers.
     """
     # --- pares rectificados ---
     lefts  = sorted(glob.glob(os.path.join(rectified_dir, "*left*_rect.png")))
@@ -54,7 +47,7 @@ def calc_disparidad(
             except Exception:
                 pass
 
-    # --- elegir qué índices se van a mostrar (pero procesamos TODOS) ---
+    # --- elegir qué índices mostrar ---
     rng = np.random.default_rng(random_state)
     k = min(n_show, len(pares))
     show_indices = set(rng.choice(len(pares), size=k, replace=False).tolist())
@@ -71,16 +64,17 @@ def calc_disparidad(
         stereo = cv2.StereoBM_create(numDisparities=num_disparities,
                                      blockSize=max(9, block_size|1))
     else:
+        bs = max(5, block_size | 1)  # asegurar impar y mínimo 5
         stereo = cv2.StereoSGBM_create(
             minDisparity=min_disparity,
             numDisparities=num_disparities,
-            blockSize=max(5, block_size|1),
-            P1=8 * (block_size ** 2),
-            P2=32 * (block_size ** 2),
+            blockSize=bs,
+            P1=8 * (bs ** 2),
+            P2=32 * (bs ** 2),
             disp12MaxDiff=1,
-            uniquenessRatio=15,
-            speckleWindowSize=200,
-            speckleRange=16,
+            uniquenessRatio=10,        # reducido para más matches
+            speckleWindowSize=100,     # reducido para objetos pequeños
+            speckleRange=32,           # aumentado para más tolerancia
             mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY
         )
 
@@ -95,9 +89,8 @@ def calc_disparidad(
         except Exception:
             print("⚠️ No se pudo importar cv2.ximgproc; continuo sin WLS.")
 
-    # --- procesar pares (se muestran solo algunos) ---
+    # --- procesar pares ---
     for i, (lp, rp) in enumerate(pares):
-        # leo color para guiar WLS y mostrar; y grises para el matcher
         Lc = cv2.imread(lp, cv2.IMREAD_COLOR)
         Rc = cv2.imread(rp, cv2.IMREAD_COLOR)
         if Lc is None or Rc is None:
@@ -105,7 +98,7 @@ def calc_disparidad(
         L = cv2.cvtColor(Lc, cv2.COLOR_BGR2GRAY)
         R = cv2.cvtColor(Rc, cv2.COLOR_BGR2GRAY)
 
-        # recorte a intersección de ROIs válidas (si existen)
+        # recorte ROI
         if roi1 and roi2:
             x1,y1,w1,h1 = roi1; x2,y2,w2,h2 = roi2
             x  = max(x1, x2);  y  = max(y1, y2)
@@ -117,7 +110,7 @@ def calc_disparidad(
         # preprocesado
         Lg, Rg = prep(L), prep(R)
 
-        # disparidad (con/sin WLS)
+        # disparidad
         if have_wls:
             dispL = stereo.compute(Lg, Rg).astype(np.float32) / 16.0
             dispR = right_matcher.compute(Rg, Lg).astype(np.float32) / 16.0
@@ -127,20 +120,24 @@ def calc_disparidad(
         else:
             disp = stereo.compute(Lg, Rg).astype(np.float32) / 16.0
 
-        # suavizado
         disp = cv2.medianBlur(disp, 5)
 
-        # visualización con percentiles (evita saturación)
-        dmask = np.isfinite(disp)
+        # *** FILTRADO DE OUTLIERS ***
+        # Aplicar máscara: disp > umbral mínimo (más agresivo para evitar Z > 2m)
+        disp_filtered = disp.copy()
+        disp_filtered[disp < 5.0] = 0  # disparidad mínima para objetos cercanos (evita outliers lejanos)
+
+        # visualización con percentiles
+        dmask = disp_filtered > 0
         if dmask.any():
-            p5, p95 = np.percentile(disp[dmask], [5, 95])
+            p5, p95 = np.percentile(disp_filtered[dmask], [5, 95])
         else:
-            p5, p95 = np.min(disp), np.max(disp)
-        disp_vis = np.clip((disp - p5) / max(p95 - p5, 1e-6), 0, 1)
+            p5, p95 = 0, np.max(disp_filtered)
+        disp_vis = np.clip((disp_filtered - p5) / max(p95 - p5, 1e-6), 0, 1)
         disp_u8 = (disp_vis * 255).astype(np.uint8)
         disp_color = cv2.applyColorMap(disp_u8, cv2.COLORMAP_JET)
 
-        # --- mostrar solo si este índice fue elegido ---
+        # mostrar solo algunos
         if i in show_indices:
             plt.figure(figsize=(10,4))
             plt.subplot(1,3,1); plt.imshow(L, cmap="gray"); plt.title("Left rect");  plt.axis("off")
