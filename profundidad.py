@@ -1,16 +1,20 @@
 import os, glob, pickle, cv2, numpy as np
 import matplotlib.pyplot as plt
+try:
+    import open3d as o3d
+except Exception:
+    o3d = None
 
 def calc_profundidad(
-    data_dir="data",
-    rectified_dir="data/rectified",
-    out_dir="data/pointcloud",
-    min_disparity=0,
-    num_disparities=224,
-    block_size=9,
-    z_min_m=0.1,     # ← ajustado
-    z_max_m=2.0,
-    use_wls=False,
+    min_disparity,
+    num_disparities,
+    block_size,
+    z_min_m,     # ← ajustado
+    z_max_m,
+    data_dir,
+    rectified_dir,
+    out_dir,
+    use_wls=True,
     pair_index=None,
     name_pattern=None,
     n_show=5,
@@ -55,11 +59,11 @@ def calc_profundidad(
         numDisparities=num_disparities,
         blockSize=block_size,
         P1=8 * (block_size ** 2),
-        P2=32 * (block_size ** 2),
-        disp12MaxDiff=1,
+        P2=16 * (block_size ** 2),
+        disp12MaxDiff=5,
         uniquenessRatio=15,
-        speckleWindowSize=200,
-        speckleRange=16,
+        speckleWindowSize=50,
+        speckleRange=32,
         mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY
     )
 
@@ -87,6 +91,24 @@ def calc_profundidad(
             for (x, y, z), (r, g, b) in zip(pts, cols):
                 f.write(f"{x} {y} {z} {int(r)} {int(g)} {int(b)}\n")
 
+    def _save_ply(points_xyz, colors_bgr, path):
+        pts = points_xyz.reshape(-1, 3)
+        cols = colors_bgr.reshape(-1, 3)
+        valid = np.isfinite(pts).all(axis=1)
+        pts = pts[valid]
+        cols = cols[valid]
+        if o3d is not None and len(pts) > 0:
+            try:
+                pcd = o3d.geometry.PointCloud()
+                pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
+                rgb = cols[:, ::-1].astype(np.float64) / 255.0  # BGR->RGB in [0,1]
+                pcd.colors = o3d.utility.Vector3dVector(rgb)
+                o3d.io.write_point_cloud(path, pcd, write_ascii=False)
+                return
+            except Exception:
+                pass
+        _save_ply_simple(pts, cols, path)
+
     ply_paths = []
     for i, (lp, rp) in enumerate(pares):
         Lc = cv2.imread(lp, cv2.IMREAD_COLOR)
@@ -104,6 +126,7 @@ def calc_profundidad(
             if xe > x and ye > y:
                 Lc, Rc = Lc[y:ye, x:xe], Rc[y:ye, x:xe]
                 Lg, Rg = Lg[y:ye, x:xe], Rg[y:ye, x:xe]
+     
 
         # Disparidad
         if have_wls:
@@ -118,7 +141,7 @@ def calc_profundidad(
         disp = cv2.medianBlur(disp, 5)
 
         # *** FILTRADO CLAVE: Disparidad mínima + filtrado de Z outliers ***
-        mask_disp = disp > 5.0  # disparidad mínima razonable
+        mask_disp = disp > 8.0  # umbral más permisivo para conservar más puntos cercanos
         pts3d = cv2.reprojectImageTo3D(disp, Q)
         pts3d[~mask_disp] = np.nan
 
@@ -127,9 +150,9 @@ def calc_profundidad(
         
         if len(Z_valid) > 0:
             # Percentiles robustos
-            z_p5, z_p95 = np.percentile(Z_valid, [5, 95])
-            z_min_robust = max(z_min_m, z_p5 - 0.2)
-            z_max_robust = min(z_max_m, z_p95 + 0.5)
+            z_p10, z_p90 = np.percentile(Z_valid, [10, 90])
+            z_min_robust = max(z_min_m, z_p10 - 0.05)
+            z_max_robust = min(z_max_m, z_p90 + 0.10)
             
             # Máscara final: Z en rango razonable
             mask_z = (Z > z_min_robust) & (Z < z_max_robust) & np.isfinite(Z)
@@ -144,7 +167,7 @@ def calc_profundidad(
         # Guardar
         base = os.path.splitext(os.path.basename(lp))[0]
         ply = os.path.join(out_dir, f"{base}.ply")
-        _save_ply_simple(pts3d_filtered, colors_filtered, ply)
+        _save_ply(pts3d_filtered, colors_filtered, ply)
         ply_paths.append(ply)
         print(f"✅ {i+1:03d}: {base} | {len(pts3d_filtered)} pts")
 
